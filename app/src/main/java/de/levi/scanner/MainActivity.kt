@@ -2,6 +2,10 @@ package de.levi.scanner
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -47,12 +51,13 @@ class MainActivity : ComponentActivity() {
     private val scansDir by lazy { File(filesDir, "scans").apply { mkdirs() } }
     private val docs = mutableStateListOf<File>()
     private var pendingExport: File? = null
+    private var busy by mutableStateOf(false)
 
     private val scanner: GmsDocumentScanner by lazy {
         val options = GmsDocumentScannerOptions.Builder()
             .setGalleryImportAllowed(true)          // auch Fotos aus der Galerie
             .setPageLimit(50)                       // mehrseitige Dokumente
-            .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+            .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG) // volle Auflösung, PDF bauen wir selbst
             .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL) // Filter, Radierer, Zuschneiden
             .build()
         GmsDocumentScanning.getClient(options)
@@ -63,8 +68,8 @@ class MainActivity : ComponentActivity() {
     ) { res ->
         if (res.resultCode == Activity.RESULT_OK) {
             val result = GmsDocumentScanningResult.fromActivityResultIntent(res.data)
-            val pdf = result?.pdf
-            if (pdf != null) savePdf(pdf.uri, pdf.pageCount)
+            val pages = result?.pages?.map { it.imageUri }.orEmpty()
+            if (pages.isNotEmpty()) buildPdf(pages)
         }
     }
 
@@ -92,6 +97,7 @@ class MainActivity : ComponentActivity() {
             AppTheme {
                 ScannerScreen(
                     docs = docs,
+                    busy = busy,
                     onScan = ::startScan,
                     onOpen = ::openPdf,
                     onShare = ::sharePdf,
@@ -118,18 +124,103 @@ class MainActivity : ComponentActivity() {
             }
     }
 
-    private fun savePdf(uri: Uri, pages: Int) {
-        val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.GERMANY).format(Date())
-        val file = File(scansDir, "Scan_$stamp.pdf")
-        try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                file.outputStream().use { input.copyTo(it) }
+    /** Baut aus den Seitenbildern ein hochauflösendes, leicht nachgeschärftes PDF (im Hintergrund). */
+    private fun buildPdf(pages: List<Uri>) {
+        busy = true
+        Thread {
+            val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.GERMANY).format(Date())
+            val file = File(scansDir, "Scan_$stamp.pdf")
+            val ok = try {
+                val pdf = PdfDocument()
+                val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                pages.forEachIndexed { i, uri ->
+                    val bmp = sharpen(loadScaled(uri, MAX_SIDE))
+                    // Seitengröße so, dass das Bild mit 300 dpi auf der Seite liegt
+                    val scale = 72f / 300f
+                    val w = (bmp.width * scale).toInt().coerceAtLeast(1)
+                    val h = (bmp.height * scale).toInt().coerceAtLeast(1)
+                    val page = pdf.startPage(PdfDocument.PageInfo.Builder(w, h, i + 1).create())
+                    page.canvas.scale(scale, scale)
+                    page.canvas.drawBitmap(bmp, 0f, 0f, paint)
+                    pdf.finishPage(page)
+                    bmp.recycle()
+                }
+                file.outputStream().use { pdf.writeTo(it) }
+                pdf.close()
+                true
+            } catch (e: Throwable) {
+                file.delete()
+                false
             }
-            reload()
-            toast(if (pages == 1) "1 Seite gespeichert" else "$pages Seiten gespeichert")
-        } catch (e: Exception) {
-            toast("Speichern fehlgeschlagen")
+            runOnUiThread {
+                busy = false
+                reload()
+                toast(
+                    when {
+                        !ok -> "Speichern fehlgeschlagen"
+                        pages.size == 1 -> "1 Seite gespeichert"
+                        else -> "${pages.size} Seiten gespeichert"
+                    }
+                )
+            }
+        }.start()
+    }
+
+    /** Lädt ein Bild und begrenzt die längste Seite auf maxSide Pixel. */
+    private fun loadScaled(uri: Uri, maxSide: Int): Bitmap {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
         }
+        val raw = contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, opts) }
+            ?: throw IllegalStateException("Bild nicht lesbar")
+        val longSide = maxOf(raw.width, raw.height)
+        if (longSide <= maxSide) return raw
+        val f = maxSide.toFloat() / longSide
+        val scaled = Bitmap.createScaledBitmap(raw, (raw.width * f).toInt(), (raw.height * f).toInt(), true)
+        if (scaled != raw) raw.recycle()
+        return scaled
+    }
+
+    /** Leichtes Nachschärfen (Kantenverstärkung), hilft bei Aufnahmen mit wenig Licht. */
+    private fun sharpen(src: Bitmap, amount: Float = SHARPEN): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w < 3 || h < 3) return src
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val out = px.copyOf()
+        val c = 1f + 4f * amount
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val i = row + x
+                val p = px[i]; val u = px[i - w]; val d = px[i + w]; val l = px[i - 1]; val r = px[i + 1]
+                var rgb = 0xFF shl 24
+                var shift = 16
+                while (shift >= 0) {
+                    val v = c * ((p shr shift) and 255) - amount * (
+                        ((u shr shift) and 255) + ((d shr shift) and 255) +
+                        ((l shr shift) and 255) + ((r shr shift) and 255))
+                    rgb = rgb or (v.toInt().coerceIn(0, 255) shl shift)
+                    shift -= 8
+                }
+                out[i] = rgb
+            }
+        }
+        val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        res.setPixels(out, 0, w, 0, 0, w, h)
+        src.recycle()
+        return res
+    }
+
+    companion object {
+        private const val MAX_SIDE = 3508   // DIN A4 bei 300 dpi
+        private const val SHARPEN = 0.35f
     }
 
     private fun uriFor(file: File): Uri =
@@ -200,6 +291,7 @@ fun AppTheme(content: @Composable () -> Unit) {
 @Composable
 fun ScannerScreen(
     docs: List<File>,
+    busy: Boolean,
     onScan: () -> Unit,
     onOpen: (File) -> Unit,
     onShare: (File) -> Unit,
@@ -214,7 +306,7 @@ fun ScannerScreen(
         topBar = { TopAppBar(title = { Text("Scanner", fontWeight = FontWeight.SemiBold) }) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = onScan,
+                onClick = { if (!busy) onScan() },
                 icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                 text = { Text("Scannen") }
             )
@@ -252,6 +344,21 @@ fun ScannerScreen(
                 }
             }
         }
+    }
+
+    if (busy) {
+        AlertDialog(
+            onDismissRequest = {},
+            confirmButton = {},
+            title = { Text("PDF wird erstellt …") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(16.dp))
+                    Text("Seiten werden in hoher Qualität verarbeitet")
+                }
+            }
+        )
     }
 
     renaming?.let { file ->
